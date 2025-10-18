@@ -1159,17 +1159,30 @@ ipcMain.handle('launch-client', async () => {
 
   log('AI attempting to launch client...');
 
-  // Method 1: Using exec with quoted path (most reliable)
+  // Verify file is accessible
   try {
-    log('Trying method 1: exec with quoted path...');
-    exec('"' + CLIENT_EXE + '"', (error) => {
-      if (error) {
-        log('Method 1 launch error (non-fatal): ' + error.message);
-      }
+    const stats = fs.statSync(CLIENT_EXE);
+    log('Client EXE verified: ' + (stats.size / 1024 / 1024).toFixed(2) + ' MB');
+  } catch (err) {
+    log('Client EXE not accessible: ' + err.message);
+    return false;
+  }
+
+  // Method 1: Using spawn with detached process (most reliable)
+  try {
+    log('Trying method 1: spawn with detached process...');
+    const { spawn } = require('child_process');
+
+    const child = spawn(CLIENT_EXE, [], {
+      detached: true,
+      stdio: 'ignore',
+      cwd: INSTALL_DIR
     });
 
-    log('Client launched successfully (method 1)');
-    setTimeout(() => app.quit(), 1000);
+    child.unref(); // Allow parent to exit independently
+
+    log('Client process spawned successfully (method 1)');
+    setTimeout(() => app.quit(), 2000);
     return true;
   } catch (err1) {
     log('Method 1 failed: ' + err1.message);

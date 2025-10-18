@@ -484,7 +484,11 @@
         updateStatus('Installation complete!', 'complete');
         updateAIMessage('✅ Installation successful!');
         updateProgress({ percent: 100, received: 0, total: 0 });
-        await sleep(1500);
+
+        // Wait longer to ensure all file handles are closed after extraction
+        updateAIMessage('Preparing to launch...');
+        await sleep(3000);
+
         launchClient();
       } catch (error) {
         showError(error.message || 'Download failed');
