@@ -2,34 +2,53 @@ const { app, BrowserWindow, ipcMain, dialog } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const { exec, spawn } = require('child_process');
-const https = require('https');
-const crypto = require('crypto');
+const http = require('http');
 
 let mainWindow;
 
 const INSTALL_DIR = 'C:\\AoX\\AoX Client';
 const CLIENT_EXE = path.join(INSTALL_DIR, 'AoX Matchmaking Client.exe');
-const UNINSTALL_EXE = path.join(INSTALL_DIR, 'Uninstall.exe');
+const CLIENT_ICON = path.join(INSTALL_DIR, 'AoX.ico');
+const UNINSTALL_BAT = path.join(require('os').tmpdir(), 'AoX-Uninstall.bat');
+const VERSION_FILE = path.join(INSTALL_DIR, 'version.json');
 const DOWNLOAD_URL = 'http://217.154.63.61:8080/downloads/aox-client-latest.zip';
 const VERSION_URL = 'http://217.154.63.61:8080/downloads/version.json';
-const TEMP_ZIP = path.join(app.getPath('temp'), 'aox-client.zip');
-const REGISTRY_KEY = 'HKLM\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\AoXClient';
+const REGISTRY_KEY = 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\AoXClient';
+const MAX_RETRIES = 3;
+const CHUNK_SIZE = 50 * 1024 * 1024;
+const LOG_FILE = path.join(app.getPath('temp'), 'aox-installer.log');
 
-let mainWindow;
+// NOTE: The NSIS installer creates a desktop shortcut to THIS bootstrapper named "AoX"
+// We don't need to create another desktop shortcut - the user clicks "AoX" to launch this app
+// This app checks for updates and launches the game client
+
+// Logging function with fixed template literals
+function log(message) {
+  const timestamp = new Date().toISOString();
+  const logMessage = '[' + timestamp + '] ' + message + '\n';
+  console.log(message);
+  try {
+    fs.appendFileSync(LOG_FILE, logMessage);
+  } catch (err) {
+    console.error('Failed to write log:', err);
+  }
+}
+
+log('=== AoX Installer Started ===');
 
 function createWindow() {
   mainWindow = new BrowserWindow({
     width: 800,
-    height: 600,
+    height: 750,
     resizable: false,
     frame: true,
     backgroundColor: '#1e1b4b',
+    icon: path.join(__dirname, 'icon.ico'),
     webPreferences: {
       nodeIntegration: false,
       contextIsolation: true,
       preload: path.join(__dirname, 'preload.js')
-    },
-    icon: path.join(__dirname, 'icon.ico')
+    }
   });
 
   mainWindow.loadFile('index.html');
@@ -37,29 +56,17 @@ function createWindow() {
 }
 
 app.whenReady().then(async () => {
-  // Check if already installed and prompt for uninstall
   const isInstalled = await checkInstalled();
   if (isInstalled) {
-    const result = await dialog.showMessageBox({
-      type: 'question',
-      buttons: ['Uninstall', 'Cancel'],
-      defaultId: 0,
-      title: 'AoX Client Already Installed',
-      message: 'AoX Client is already installed. Would you like to uninstall it?'
-    });
-    
-    if (result.response === 0) {
-      // Run uninstaller
-      await runUninstaller();
-      app.quit();
-      return;
-    } else {
-      app.quit();
-      return;
-    }
-  }
+    log('AoX Client detected as already installed - opening installer to check for updates...');
 
-  createWindow();
+    // Open installer window - it will auto-check for updates and download if needed
+    // The UI will handle everything (see index.html checkAndDownload function)
+    createWindow();
+  } else {
+    log('No existing installation found, proceeding with installation');
+    createWindow();
+  }
 
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) {
@@ -72,37 +79,342 @@ app.on('window-all-closed', () => {
   app.quit();
 });
 
+// Improved installation check - verify complete installation
 function checkInstalled() {
-  return fs.existsSync(CLIENT_EXE);
+  log('Checking if AoX Client is already installed...');
+  
+  // Check registry first
+  try {
+    const regCheck = require('child_process').execSync(
+      'reg query "' + REGISTRY_KEY + '" /v InstallLocation 2>nul',
+      { encoding: 'utf8' }
+    );
+    
+    if (regCheck && regCheck.includes(INSTALL_DIR)) {
+      log('Found registry entry for AoX Client');
+      
+      // Verify the EXE actually exists and is valid
+      if (fs.existsSync(CLIENT_EXE)) {
+        const stats = fs.statSync(CLIENT_EXE);
+        // EXE should be at least 50MB to be a valid Electron app
+        if (stats.size > 50 * 1024 * 1024) {
+          log('Valid installation found: ' + CLIENT_EXE + ' (' + (stats.size / 1024 / 1024).toFixed(2) + ' MB)');
+          return true;
+        } else {
+          log('EXE exists but is too small (' + stats.size + ' bytes) - likely corrupt');
+        }
+      } else {
+        log('Registry entry exists but EXE not found - cleaning up registry');
+        removeFromRegistry();
+      }
+    }
+  } catch (err) {
+    log('No registry entry found (this is normal for fresh install): ' + err.message);
+  }
+
+  // Double-check: even without registry, check if files exist
+  if (fs.existsSync(CLIENT_EXE)) {
+    try {
+      const stats = fs.statSync(CLIENT_EXE);
+      if (stats.size > 50 * 1024 * 1024) {
+        log('Found valid EXE without registry entry: ' + CLIENT_EXE);
+        return true;
+      }
+    } catch (err) {
+      log('Error checking EXE: ' + err.message);
+    }
+  }
+
+  log('No valid installation detected');
+  return false;
 }
 
 function runUninstaller() {
   return new Promise((resolve) => {
-    if (fs.existsSync(UNINSTALL_EXE)) {
-      exec(`"${UNINSTALL_EXE}"`, (error) => {
+    if (fs.existsSync(UNINSTALL_BAT)) {
+      log('Running uninstaller: ' + UNINSTALL_BAT);
+      exec('cmd.exe /c "' + UNINSTALL_BAT + '"', (error) => {
+        if (error) {
+          log('Uninstaller error: ' + error.message);
+        }
         resolve();
       });
     } else {
-      // Manual cleanup
+      log('Uninstaller not found, performing manual cleanup');
       removeFromRegistry();
-      if (fs.existsSync(INSTALL_DIR)) {
-        fs.rmSync(INSTALL_DIR, { recursive: true, force: true });
-      }
-      resolve();
+      
+      // Kill any running client
+      exec('taskkill /F /IM "AoX Matchmaking Client.exe" 2>nul', () => {
+        setTimeout(() => {
+          // Remove the client directory
+          if (fs.existsSync(INSTALL_DIR)) {
+            try {
+              fs.rmSync(INSTALL_DIR, { recursive: true, force: true });
+              log('Removed install directory: ' + INSTALL_DIR);
+            } catch (err) {
+              log('Error removing install directory: ' + err.message);
+            }
+          }
+          
+          // Remove the parent AoX directory if it exists
+          if (fs.existsSync('C:\\AoX')) {
+            try {
+              fs.rmSync('C:\\AoX', { recursive: true, force: true });
+              log('Removed parent directory: C:\\AoX');
+            } catch (err) {
+              log('Error removing parent directory: ' + err.message);
+            }
+          }
+          
+          // Remove desktop shortcut - but check if it exists first and handle errors gracefully
+          const desktopPath = path.join(require('os').homedir(), 'Desktop');
+          const shortcutPath = path.join(desktopPath, 'AoX.lnk');
+          if (fs.existsSync(shortcutPath)) {
+            try {
+              fs.unlinkSync(shortcutPath);
+              log('Removed desktop shortcut: ' + shortcutPath);
+            } catch (err) {
+              log('Could not remove shortcut (non-fatal): ' + err.message);
+              // Try with cmd.exe as fallback
+              exec('del /f /q "' + shortcutPath + '" 2>nul', (cmdErr) => {
+                if (cmdErr) {
+                  log('CMD delete also failed: ' + cmdErr.message);
+                }
+              });
+            }
+          } else {
+            log('Desktop shortcut does not exist, skipping: ' + shortcutPath);
+          }
+          
+          resolve();
+        }, 1000); // Wait for process to close
+      });
     }
   });
 }
 
-function downloadFile(url, dest, onProgress) {
+// AI-POWERED DOWNLOAD WITH INTELLIGENT FALLBACKS
+function downloadFileWithRetry(url, dest, onProgress, event, retryCount = 0) {
+  return new Promise(async (resolve, reject) => {
+    log('AI Smart Download: Attempt ' + (retryCount + 1) + '/' + (MAX_RETRIES + 1) + '...');
+    if (event) {
+      event.sender.send('ai-message', 'AI analyzing best download method (attempt ' + (retryCount + 1) + '/' + (MAX_RETRIES + 1) + ')...');
+    }
+
+    // Ensure destination directory exists
+    const destDir = path.dirname(dest);
+    if (!fs.existsSync(destDir)) {
+      fs.mkdirSync(destDir, { recursive: true });
+      log('Created directory: ' + destDir);
+    }
+
+    // Define download methods in priority order
+    const methods = [
+      { name: 'HTTP with Connection Keepalive', fn: downloadWithHTTPKeepalive },
+      { name: 'Chunked Download with Resume', fn: downloadInChunks },
+      { name: 'Basic HTTP Stream', fn: downloadFileSingle },
+      { name: 'PowerShell with Progress', fn: downloadWithPowerShell }
+    ];
+
+    // Try each method
+    for (let i = 0; i < methods.length; i++) {
+      const method = methods[i];
+      try {
+        log('Trying method ' + (i + 1) + '/' + methods.length + ': ' + method.name + '...');
+        if (event) {
+          event.sender.send('ai-message', 'Trying: ' + method.name + '...');
+        }
+
+        if (method.name === 'Basic HTTP Stream') {
+          const protocol = url.startsWith('https') ? require('https') : require('http');
+          await method.fn(url, dest, onProgress, protocol);
+        } else {
+          await method.fn(url, dest, onProgress);
+        }
+
+        // Verify download succeeded
+        if (fs.existsSync(dest) && fs.statSync(dest).size > 1024) {
+          log('Download successful with ' + method.name);
+          if (event) {
+            event.sender.send('ai-message', 'Success with ' + method.name);
+          }
+          return resolve();
+        }
+
+      } catch (error) {
+        log('Method failed - ' + method.name + ': ' + error.message);
+        if (event) {
+          event.sender.send('ai-message', method.name + ' failed, trying next...');
+        }
+
+        // Clean up partial download
+        if (fs.existsSync(dest)) {
+          try {
+            fs.unlinkSync(dest);
+            log('Cleaned up partial file: ' + dest);
+          } catch (e) {
+            log('Could not clean partial file: ' + e.message);
+          }
+        }
+      }
+    }
+
+    // All methods failed - retry if attempts remaining
+    if (retryCount < MAX_RETRIES) {
+      const waitTime = Math.pow(2, retryCount) * 2000; // 2s, 4s, 8s
+      log('All methods failed. AI deciding to retry in ' + (waitTime/1000) + 's...');
+      if (event) {
+        event.sender.send('ai-message', 'All methods failed. AI retrying in ' + (waitTime/1000) + 's...');
+      }
+
+      await new Promise(r => setTimeout(r, waitTime));
+
+      try {
+        await downloadFileWithRetry(url, dest, onProgress, event, retryCount + 1);
+        resolve();
+      } catch (retryError) {
+        reject(retryError);
+      }
+    } else {
+      const finalError = new Error('AI exhausted all ' + (MAX_RETRIES + 1) + ' attempts and ' + methods.length + ' methods');
+      log(finalError.message);
+      reject(finalError);
+    }
+  });
+}
+
+// Method 1: HTTP with Connection keepalive (most reliable for large files)
+function downloadWithHTTPKeepalive(url, dest, onProgress) {
   return new Promise((resolve, reject) => {
     const protocol = url.startsWith('https') ? require('https') : require('http');
     const file = fs.createWriteStream(dest);
     let receivedBytes = 0;
     let totalBytes = 0;
 
-    protocol.get(url, (response) => {
+    const options = {
+      headers: {
+        'Connection': 'keep-alive',
+        'Keep-Alive': 'timeout=30, max=100'
+      }
+    };
+
+    const request = protocol.get(url, options, (response) => {
       if (response.statusCode !== 200) {
-        reject(new Error(`Failed to download: ${response.statusCode}`));
+        reject(new Error('HTTP ' + response.statusCode));
+        return;
+      }
+
+      totalBytes = parseInt(response.headers['content-length'], 10);
+      log('Download size: ' + (totalBytes / 1024 / 1024).toFixed(2) + ' MB');
+
+      response.on('data', (chunk) => {
+        receivedBytes += chunk.length;
+        if (onProgress && totalBytes) {
+          onProgress({
+            percent: Math.round((receivedBytes / totalBytes) * 100),
+            received: receivedBytes,
+            total: totalBytes
+          });
+        }
+      });
+
+      response.pipe(file);
+
+      file.on('finish', () => {
+        file.close(() => {
+          log('File written: ' + dest);
+          resolve();
+        });
+      });
+    });
+
+    request.on('error', (err) => {
+      fs.unlink(dest, () => reject(err));
+    });
+
+    file.on('error', (err) => {
+      fs.unlink(dest, () => reject(err));
+    });
+
+    request.setTimeout(60000, () => {
+      request.destroy();
+      reject(new Error('Request timeout'));
+    });
+  });
+}
+
+// Method 2: Download in chunks with resume capability
+function downloadInChunks(url, dest, onProgress) {
+  return new Promise(async (resolve, reject) => {
+    try {
+      const protocol = url.startsWith('https') ? require('https') : require('http');
+
+      // Get file size first
+      const sizeReq = await new Promise((res, rej) => {
+        protocol.request(url, { method: 'HEAD' }, (response) => {
+          res(parseInt(response.headers['content-length'], 10));
+        }).on('error', rej).end();
+      });
+
+      const totalBytes = sizeReq;
+      let downloadedBytes = 0;
+
+      const writeStream = fs.createWriteStream(dest);
+
+      // Download in chunks
+      const chunkSize = CHUNK_SIZE;
+      for (let start = 0; start < totalBytes; start += chunkSize) {
+        const end = Math.min(start + chunkSize - 1, totalBytes - 1);
+
+        const chunk = await new Promise((res, rej) => {
+          const options = {
+            headers: {
+              'Range': 'bytes=' + start + '-' + end
+            }
+          };
+
+          protocol.get(url, options, (response) => {
+            const buffers = [];
+            response.on('data', (data) => buffers.push(data));
+            response.on('end', () => res(Buffer.concat(buffers)));
+          }).on('error', rej);
+        });
+
+        writeStream.write(chunk);
+        downloadedBytes += chunk.length;
+
+        if (onProgress) {
+          onProgress({
+            percent: Math.round((downloadedBytes / totalBytes) * 100),
+            received: downloadedBytes,
+            total: totalBytes
+          });
+        }
+      }
+
+      writeStream.end();
+      await new Promise((res, rej) => {
+        writeStream.on('finish', res);
+        writeStream.on('error', rej);
+      });
+
+      resolve();
+    } catch (err) {
+      reject(err);
+    }
+  });
+}
+
+// Method 3: Basic stream download
+function downloadFileSingle(url, dest, onProgress, protocol) {
+  return new Promise((resolve, reject) => {
+    const file = fs.createWriteStream(dest);
+    let receivedBytes = 0;
+    let totalBytes = 0;
+
+    const request = protocol.get(url, (response) => {
+      if (response.statusCode !== 200) {
+        reject(new Error('Server returned status code ' + response.statusCode));
         return;
       }
 
@@ -110,226 +422,771 @@ function downloadFile(url, dest, onProgress) {
 
       response.on('data', (chunk) => {
         receivedBytes += chunk.length;
-        if (onProgress) {
-          const progress = Math.floor((receivedBytes / totalBytes) * 100);
-          const downloadedMB = (receivedBytes / 1024 / 1024).toFixed(1);
-          const totalMB = (totalBytes / 1024 / 1024).toFixed(1);
-          onProgress({ progress, downloadedMB, totalMB });
+        if (onProgress && totalBytes) {
+          onProgress({
+            percent: Math.round((receivedBytes / totalBytes) * 100),
+            received: receivedBytes,
+            total: totalBytes
+          });
         }
       });
 
       response.pipe(file);
 
       file.on('finish', () => {
-        file.close();
-        resolve();
+        file.close(() => resolve());
       });
+    });
 
-      file.on('error', (err) => {
-        fs.unlink(dest, () => {});
-        reject(err);
-      });
-    }).on('error', (err) => {
-      fs.unlink(dest, () => {});
-      reject(err);
+    request.on('error', (err) => {
+      fs.unlink(dest, () => reject(err));
+    });
+
+    file.on('error', (err) => {
+      fs.unlink(dest, () => reject(err));
     });
   });
 }
 
-function extractZip(zipPath, destPath) {
+// Method 4: PowerShell fallback
+function downloadWithPowerShell(url, dest, onProgress) {
   return new Promise((resolve, reject) => {
-    const unzipper = require('unzipper');
+    const escapedDest = dest.replace(/\\/g, '\\\\').replace(/'/g, "''");
+    const psScript = "$ProgressPreference = 'SilentlyContinue'; Invoke-WebRequest -Uri '" + url + "' -OutFile '" + escapedDest + "' -UseBasicParsing -TimeoutSec 120";
+
+    exec('powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "' + psScript.replace(/"/g, '\\"') + '"', 
+      { maxBuffer: 10 * 1024 * 1024 },
+      (error) => {
+        if (error) {
+          reject(error);
+        } else {
+          resolve();
+        }
+      }
+    );
+  });
+}
+
+// AI-POWERED ZIP EXTRACTION with multiple methods
+function extractZip(zipPath, targetPath, onProgress, event) {
+  return new Promise(async (resolve, reject) => {
+    log('AI Smart Extraction starting...');
+    if (event) {
+      event.sender.send('ai-message', 'AI analyzing best extraction method...');
+    }
+
+    // Ensure target exists
+    if (!fs.existsSync(targetPath)) {
+      fs.mkdirSync(targetPath, { recursive: true });
+      log('Created target directory: ' + targetPath);
+    }
+
+    const methods = [
+      { name: 'Node.js adm-zip', fn: extractWithAdmZip },
+      { name: 'PowerShell Expand-Archive', fn: extractWithPowerShell },
+      { name: 'Node.js unzipper stream', fn: extractWithUnzipper }
+    ];
+
+    for (let i = 0; i < methods.length; i++) {
+      const method = methods[i];
+      try {
+        log('Trying extraction method ' + (i + 1) + '/' + methods.length + ': ' + method.name + '...');
+        if (event) {
+          event.sender.send('ai-message', 'Trying: ' + method.name + '...');
+        }
+
+        await method.fn(zipPath, targetPath, onProgress);
+
+        // Verify extraction
+        const files = fs.readdirSync(targetPath);
+        if (files.length > 0) {
+          log('Extraction successful with ' + method.name + ' (' + files.length + ' files/folders)');
+          if (event) {
+            event.sender.send('ai-message', 'Success with ' + method.name);
+          }
+          return resolve();
+        }
+
+      } catch (error) {
+        log('Extraction method failed - ' + method.name + ': ' + error.message);
+        if (event) {
+          event.sender.send('ai-message', method.name + ' failed, trying next...');
+        }
+
+        // Clean up failed extraction
+        try {
+          if (fs.existsSync(targetPath)) {
+            const files = fs.readdirSync(targetPath);
+            files.forEach(file => {
+              const filePath = path.join(targetPath, file);
+              try {
+                fs.rmSync(filePath, { recursive: true, force: true });
+              } catch (e) {
+                log('Could not remove: ' + filePath);
+              }
+            });
+          }
+        } catch (cleanupErr) {
+          log('Cleanup warning: ' + cleanupErr.message);
+        }
+      }
+    }
+
+    reject(new Error('All extraction methods failed'));
+  });
+}
+
+// Extraction Method 1: adm-zip
+function extractWithAdmZip(zipPath, targetPath, onProgress) {
+  return new Promise((resolve, reject) => {
+    try {
+      const AdmZip = require('adm-zip');
+      const zip = new AdmZip(zipPath);
+      zip.extractAllTo(targetPath, true);
+      resolve();
+    } catch (err) {
+      reject(err);
+    }
+  });
+}
+
+// Extraction Method 2: PowerShell with proper path quoting
+function extractWithPowerShell(zipPath, targetPath, onProgress) {
+  return new Promise((resolve, reject) => {
+    // Escape single quotes for PowerShell and use single quotes for paths
+    const escapedZip = zipPath.replace(/'/g, "''");
+    const escapedTarget = targetPath.replace(/'/g, "''");
     
-    fs.createReadStream(zipPath)
-      .pipe(unzipper.Extract({ path: destPath }))
-      .on('close', () => {
-        resolve();
-      })
-      .on('error', (err) => {
-        reject(err);
-      });
+    // Use -LiteralPath to avoid wildcard interpretation
+    const psCommand = "Expand-Archive -LiteralPath '" + escapedZip + "' -DestinationPath '" + escapedTarget + "' -Force";
+    
+    log('PowerShell command: ' + psCommand);
+    
+    exec('powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "' + psCommand + '"', 
+      { maxBuffer: 50 * 1024 * 1024 },
+      (error, stdout, stderr) => {
+        if (error) {
+          log('PowerShell stderr: ' + stderr);
+          reject(new Error('PowerShell extraction failed: ' + (stderr || error.message)));
+        } else {
+          log('PowerShell extraction completed');
+          resolve();
+        }
+      }
+    );
+  });
+}
+
+// Extraction Method 3: unzipper
+function extractWithUnzipper(zipPath, targetPath, onProgress) {
+  return new Promise((resolve, reject) => {
+    try {
+      const unzipper = require('unzipper');
+      fs.createReadStream(zipPath)
+        .pipe(unzipper.Extract({ path: targetPath }))
+        .on('close', () => resolve())
+        .on('error', (err) => reject(err));
+    } catch (err) {
+      reject(err);
+    }
   });
 }
 
 function verifyInstallation() {
-  // Check if main executable exists
+  log('Verifying installation...');
+  
   if (!fs.existsSync(CLIENT_EXE)) {
+    log('Verification failed: Client EXE not found');
     return false;
   }
+
+  const stats = fs.statSync(CLIENT_EXE);
+  log('Client EXE size: ' + (stats.size / 1024 / 1024).toFixed(2) + ' MB');
   
-  // Add more verification checks as needed
+  if (stats.size < 1024 * 1024) {
+    log('Verification failed: Client EXE too small');
+    return false;
+  }
+
+  log('Verification passed');
   return true;
 }
 
-function addToRegistry() {
-  const regScript = `
-    Windows Registry Editor Version 5.00
-
-    [${REGISTRY_KEY.replace(/\\/g, '\\\\')}]
-    "DisplayName"="AoX Matchmaking Client"
-    "DisplayVersion"="1.1.3"
-    "Publisher"="AoX Net"
-    "InstallLocation"="${INSTALL_DIR.replace(/\\/g, '\\\\')}"
-    "UninstallString"="${UNINSTALL_EXE.replace(/\\/g, '\\\\')}"
-    "DisplayIcon"="${CLIENT_EXE.replace(/\\/g, '\\\\')}"
-    "NoModify"=dword:00000001
-    "NoRepair"=dword:00000001
-  `;
-
-  const regFile = path.join(app.getPath('temp'), 'aox-install.reg');
-  fs.writeFileSync(regFile, regScript);
-
-  return new Promise((resolve) => {
-    exec(`reg import "${regFile}"`, (error) => {
-      fs.unlinkSync(regFile);
-      resolve(!error);
-    });
-  });
+async function installPrerequisites(event) {
+  log('Installing prerequisites...');
+  
+  // Prerequisites are unpacked from ASAR to app.asar.unpacked folder
+  const prereqPath = path.join(__dirname, 'prerequisites');
+  const prereqPathUnpacked = path.join(path.dirname(__dirname), 'app.asar.unpacked', 'prerequisites');
+  
+  // Check which path exists (packed vs unpacked)
+  let actualPrereqPath = prereqPath;
+  if (fs.existsSync(prereqPathUnpacked)) {
+    actualPrereqPath = prereqPathUnpacked;
+    log('Using unpacked prerequisites: ' + actualPrereqPath);
+  } else if (fs.existsSync(prereqPath)) {
+    log('Using prerequisites: ' + actualPrereqPath);
+  } else {
+    log('Prerequisites folder not found at: ' + prereqPath + ' or ' + prereqPathUnpacked);
+    return;
+  }
+  
+  const vcRedist = path.join(actualPrereqPath, 'vc_redist.x64.exe');
+  const tapAdapter = path.join(actualPrereqPath, 'tap-windows-9.24.7.exe');
+  
+  // Check if VC++ Redistributable is already installed
+  let vcppInstalled = false;
+  try {
+    const vcppCheck = require('child_process').execSync(
+      'reg query "HKLM\\SOFTWARE\\Microsoft\\VisualStudio\\14.0\\VC\\Runtimes\\x64" /v Version 2>nul',
+      { encoding: 'utf8' }
+    );
+    if (vcppCheck) {
+      vcppInstalled = true;
+      log('VC++ Redistributable already installed');
+    }
+  } catch (err) {
+    log('VC++ Redistributable not found in registry');
+  }
+  
+  // Install VC++ Redistributable (silent install) if not already installed
+  if (!vcppInstalled && fs.existsSync(vcRedist)) {
+    try {
+      log('Installing Visual C++ Redistributable from: ' + vcRedist);
+      if (event) {
+        event.sender.send('ai-message', 'Installing Visual C++ Redistributable...');
+      }
+      
+      await new Promise((resolve, reject) => {
+        exec('"' + vcRedist + '" /install /quiet /norestart', (error, stdout, stderr) => {
+          if (error) {
+            // Exit code 3010 means success but reboot required
+            // Exit code 1638 means already installed
+            if (error.code === 3010 || error.code === 1638) {
+              log('VC++ Redistributable installed (may need reboot or already installed)');
+              resolve();
+            } else {
+              log('VC++ Redistributable install warning: ' + error.message);
+              resolve(); // Don't fail installation if VC++ fails
+            }
+          } else {
+            log('VC++ Redistributable installed successfully');
+            resolve();
+          }
+        });
+      });
+    } catch (err) {
+      log('Error installing VC++ Redistributable: ' + err.message);
+    }
+  } else if (!fs.existsSync(vcRedist)) {
+    log('VC++ Redistributable not found at: ' + vcRedist);
+  }
+  
+  // Check if TAP-Windows Adapter is already installed
+  let tapInstalled = false;
+  try {
+    const tapCheck = require('child_process').execSync(
+      'reg query "HKLM\\SOFTWARE\\Wow6432Node\\TAP-Windows" 2>nul || reg query "HKLM\\SOFTWARE\\TAP-Windows" 2>nul',
+      { encoding: 'utf8' }
+    );
+    if (tapCheck) {
+      tapInstalled = true;
+      log('TAP-Windows Adapter already installed');
+    }
+  } catch (err) {
+    log('TAP-Windows Adapter not found in registry');
+  }
+  
+  // Install TAP-Windows Adapter (silent install) if not already installed
+  if (!tapInstalled && fs.existsSync(tapAdapter)) {
+    try {
+      log('Installing TAP-Windows Adapter from: ' + tapAdapter);
+      if (event) {
+        event.sender.send('ai-message', 'Installing TAP-Windows network adapter...');
+      }
+      
+      await new Promise((resolve, reject) => {
+        exec('"' + tapAdapter + '" /S', (error, stdout, stderr) => {
+          if (error) {
+            log('TAP Adapter install warning: ' + error.message);
+            resolve(); // Don't fail installation if TAP fails
+          } else {
+            log('TAP-Windows Adapter installed successfully');
+            resolve();
+          }
+        });
+      });
+    } catch (err) {
+      log('Error installing TAP Adapter: ' + err.message);
+    }
+  } else if (!fs.existsSync(tapAdapter)) {
+    log('TAP Adapter not found at: ' + tapAdapter);
+  }
+  
+  log('Prerequisites installation complete');
 }
 
-function removeFromRegistry() {
-  return new Promise((resolve) => {
-    exec(`reg delete "${REGISTRY_KEY}" /f`, (error) => {
-      resolve(!error);
+function createDesktopShortcut() {
+  return new Promise((resolve, reject) => {
+    const desktopPath = path.join(require('os').homedir(), 'Desktop');
+    const shortcutPath = path.join(desktopPath, 'AoX.lnk');
+    
+    log('Creating desktop shortcut at: ' + shortcutPath);
+    log('Shortcut target: ' + CLIENT_EXE);
+    
+    // Check if client EXE exists before creating shortcut
+    if (!fs.existsSync(CLIENT_EXE)) {
+      log('ERROR: Client EXE does not exist yet, cannot create shortcut');
+      resolve(); // Don't fail, just log
+      return;
+    }
+    
+    // Ensure icon exists in installation directory
+    const sourceIcon = path.join(__dirname, 'AoX.ico');
+    if (fs.existsSync(sourceIcon) && !fs.existsSync(CLIENT_ICON)) {
+      try {
+        fs.copyFileSync(sourceIcon, CLIENT_ICON);
+        log('Copied icon to installation directory: ' + CLIENT_ICON);
+      } catch (err) {
+        log('WARNING: Could not copy icon: ' + err.message);
+      }
+    }
+    
+    // Use PowerShell to create the shortcut (more reliable than VBScript)
+    const psScript = [
+      "$WshShell = New-Object -ComObject WScript.Shell",
+      "$Shortcut = $WshShell.CreateShortcut('" + shortcutPath.replace(/\\/g, '\\\\').replace(/'/g, "''") + "')",
+      "$Shortcut.TargetPath = '" + CLIENT_EXE.replace(/\\/g, '\\\\').replace(/'/g, "''") + "'",
+      "$Shortcut.WorkingDirectory = '" + INSTALL_DIR.replace(/\\/g, '\\\\').replace(/'/g, "''") + "'",
+      "$Shortcut.IconLocation = '" + (fs.existsSync(CLIENT_ICON) ? CLIENT_ICON : CLIENT_EXE).replace(/\\/g, '\\\\').replace(/'/g, "''") + ",0'",
+      "$Shortcut.Description = 'Launch AoX Matchmaking Client'",
+      "$Shortcut.Save()"
+    ].join('; ');
+    
+    log('Creating shortcut with PowerShell...');
+    
+    exec('powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "' + psScript + '"', (error, stdout, stderr) => {
+      if (error) {
+        log('Failed to create desktop shortcut: ' + error.message);
+        if (stderr) log('PowerShell stderr: ' + stderr);
+        resolve(); // Don't fail installation if shortcut fails
+      } else {
+        log('Desktop shortcut created successfully');
+        
+        // Verify the shortcut was created
+        if (fs.existsSync(shortcutPath)) {
+          log('Verified: Shortcut file exists at ' + shortcutPath);
+        } else {
+          log('WARNING: Shortcut file does not exist after creation');
+        }
+        
+        resolve();
+      }
     });
   });
 }
 
 function createUninstaller() {
-  const uninstallScript = `
-    @echo off
-    echo Uninstalling AoX Matchmaking Client...
-    
-    REM Close any running instances
-    taskkill /F /IM "AoX Matchmaking Client.exe" 2>nul
-    
-    REM Remove registry entry
-    reg delete "${REGISTRY_KEY}" /f 2>nul
-    
-    REM Remove files
-    timeout /t 2 /nobreak >nul
-    cd ..
-    rmdir /S /Q "${INSTALL_DIR}"
-    
-    echo Uninstallation complete!
-    pause
-  `;
+  // Create uninstaller in TEMP folder (outside C:\AoX so it won't delete itself)
+  // NOTE: The desktop shortcut "AoX" is created by NSIS and points to the bootstrapper
+  // The NSIS uninstaller will remove it - we don't manage it here
+  const uninstallScript = [
+    '@echo off',
+    'title Uninstalling AoX',
+    'echo.',
+    'echo ========================================',
+    'echo   Uninstalling AoX',
+    'echo ========================================',
+    'echo.',
+    'echo Please wait while AoX is being removed...',
+    'echo.',
+    '',
+    ':: Wait a moment for any running processes to close',
+    'timeout /t 2 /nobreak > nul',
+    '',
+    ':: Close any running AoX client',
+    'taskkill /F /IM "AoX Matchmaking Client.exe" 2>nul',
+    'timeout /t 1 /nobreak > nul',
+    '',
+    ':: Remove installation directory',
+    'echo Removing installation files...',
+    'rd /s /q "' + INSTALL_DIR + '" 2>nul',
+    '',
+    ':: Remove parent AoX folder',
+    'echo Removing AoX folder...',
+    'rd /s /q "C:\\AoX" 2>nul',
+    '',
+    ':: Remove this uninstaller script itself',
+    'echo Cleaning up...',
+    'del /f /q "%~f0" 2>nul',
+    '',
+    'echo.',
+    'echo ========================================',
+    'echo   Uninstall Complete!',
+    'echo ========================================',
+    'echo.',
+    'echo AoX has been completely removed from your computer.',
+    'echo.',
+    'pause',
+    '',
+    ':: Exit',
+    'exit'
+  ].join('\r\n');
 
-  const batPath = path.join(INSTALL_DIR, 'uninstall.bat');
-  fs.writeFileSync(batPath, uninstallScript);
-
-  // Convert to exe would require additional tools, for now use batch
-  fs.copyFileSync(batPath, UNINSTALL_EXE.replace('.exe', '.bat'));
+  try {
+    fs.writeFileSync(UNINSTALL_BAT, uninstallScript);
+    log('Uninstaller created: ' + UNINSTALL_BAT);
+  } catch (err) {
+    log('ERROR creating uninstaller: ' + err.message);
+  }
 }
 
-// IPC Handlers
+async function addToRegistry() {
+  return new Promise((resolve, reject) => {
+    const commands = [
+      'reg add "' + REGISTRY_KEY + '" /v DisplayName /t REG_SZ /d "AoX" /f',
+      'reg add "' + REGISTRY_KEY + '" /v InstallLocation /t REG_SZ /d "' + INSTALL_DIR + '" /f',
+      'reg add "' + REGISTRY_KEY + '" /v UninstallString /t REG_SZ /d "cmd.exe /c \\"' + UNINSTALL_BAT + '\\"" /f',
+      'reg add "' + REGISTRY_KEY + '" /v DisplayIcon /t REG_SZ /d "' + CLIENT_EXE + '" /f',
+      'reg add "' + REGISTRY_KEY + '" /v Publisher /t REG_SZ /d "AoX Net" /f',
+      'reg add "' + REGISTRY_KEY + '" /v NoModify /t REG_DWORD /d 1 /f',
+      'reg add "' + REGISTRY_KEY + '" /v NoRepair /t REG_DWORD /d 1 /f'
+    ];
+
+    let completed = 0;
+    commands.forEach(cmd => {
+      exec(cmd, (error) => {
+        if (error) {
+          log('Registry command failed: ' + cmd + ' - ' + error.message);
+        } else {
+          log('Registry command succeeded: ' + cmd);
+        }
+        completed++;
+        if (completed === commands.length) {
+          resolve();
+        }
+      });
+    });
+  });
+}
+
+function removeFromRegistry() {
+  exec('reg delete "' + REGISTRY_KEY + '" /f', (error) => {
+    if (error) {
+      log('Registry removal failed (may not exist): ' + error.message);
+    } else {
+      log('Registry entry removed');
+    }
+  });
+}
+
+// Get local version from installed client
+function getLocalVersion() {
+  try {
+    if (fs.existsSync(VERSION_FILE)) {
+      const versionData = JSON.parse(fs.readFileSync(VERSION_FILE, 'utf8'));
+      log('Local version: ' + versionData.version);
+      return versionData.version;
+    }
+  } catch (err) {
+    log('Error reading local version: ' + err.message);
+  }
+  return null;
+}
+
+// Fetch server version
+function fetchServerVersion() {
+  return new Promise((resolve, reject) => {
+    http.get(VERSION_URL, (response) => {
+      let data = '';
+      response.on('data', chunk => data += chunk);
+      response.on('end', () => {
+        try {
+          const versionData = JSON.parse(data);
+          log('Server version: ' + versionData.version);
+          resolve(versionData.version);
+        } catch (err) {
+          reject(new Error('Failed to parse version data'));
+        }
+      });
+    }).on('error', (err) => {
+      reject(err);
+    });
+  });
+}
+
+// IPC Handlers - ADDED MISSING HANDLERS
+ipcMain.handle('check-installed', async () => {
+  return await checkInstalled();
+});
+
+ipcMain.handle('get-local-version', async () => {
+  return getLocalVersion();
+});
+
+ipcMain.handle('fetch-server-version', async () => {
+  return await fetchServerVersion();
+});
+
 ipcMain.handle('get-install-path', () => {
   return INSTALL_DIR;
 });
 
-ipcMain.handle('check-installed', () => {
-  return checkInstalled();
-});
-
-ipcMain.handle('get-local-version', () => {
-  return '1.1.3';
-});
-
-ipcMain.handle('fetch-server-version', async () => {
-  return new Promise((resolve) => {
-    const protocol = VERSION_URL.startsWith('https') ? require('https') : require('http');
-    
-    protocol.get(VERSION_URL, (response) => {
-      let data = '';
-      response.on('data', (chunk) => { data += chunk; });
-      response.on('end', () => {
-        try {
-          const json = JSON.parse(data);
-          resolve(json.version || '1.1.3');
-        } catch (e) {
-          resolve('1.1.3');
-        }
-      });
-    }).on('error', () => {
-      resolve('1.1.3');
-    });
-  });
-});
-
+// Main download and installation handler
 ipcMain.handle('download-client', async (event) => {
+  const tempDir = path.join(app.getPath('temp'), 'aox-install-' + Date.now());
+  const TEMP_ZIP = path.join(tempDir, 'aox-client.zip');
+
   try {
-    // Ensure install directory exists
-    if (!fs.existsSync(INSTALL_DIR)) {
-      fs.mkdirSync(INSTALL_DIR, { recursive: true });
+    log('=== Starting Installation ===');
+    event.sender.send('ai-message', 'AI-powered installation starting...');
+
+    // Create temp directory
+    if (!fs.existsSync(tempDir)) {
+      fs.mkdirSync(tempDir, { recursive: true });
+      log('Created temp directory: ' + tempDir);
     }
 
-    // Step 1: Download
-    event.sender.send('status-update', { status: 'downloading', message: 'Downloading client...' });
-    
-    await downloadFile(DOWNLOAD_URL, TEMP_ZIP, (progress) => {
-      event.sender.send('download-progress', progress);
+    // Step 1: Check server connection
+    event.sender.send('status-update', { status: 'checking', message: 'Checking server connection...' });
+    event.sender.send('ai-message', 'AI checking server availability...');
+
+    const serverOk = await new Promise((resolve) => {
+      const request = http.get(VERSION_URL, (response) => {
+        resolve(response.statusCode === 200);
+      });
+      request.on('error', () => resolve(false));
+      request.setTimeout(5000, () => {
+        request.destroy();
+        resolve(false);
+      });
     });
 
-    // Step 2: Verify (basic check)
-    event.sender.send('status-update', { status: 'verifying', message: 'Verifying download...' });
-    await new Promise(resolve => setTimeout(resolve, 500));
-
-    if (!fs.existsSync(TEMP_ZIP) || fs.statSync(TEMP_ZIP).size === 0) {
-      throw new Error('Download verification failed');
+    if (!serverOk) {
+      throw new Error('Cannot connect to download server. Please check your internet connection.');
     }
 
-    // Step 3: Extract
-    event.sender.send('status-update', { status: 'installing', message: 'Installing files...' });
-    await extractZip(TEMP_ZIP, INSTALL_DIR);
+    log('Server connection OK');
+    event.sender.send('ai-message', 'Server connection verified');
+
+    // Step 2: Download with AI
+    event.sender.send('status-update', { 
+      status: 'downloading', 
+      message: 'Downloading from server...',
+      downloadPath: 'Downloading to: ' + TEMP_ZIP
+    });
+
+    await downloadFileWithRetry(
+      DOWNLOAD_URL,
+      TEMP_ZIP,
+      (progress) => {
+        event.sender.send('download-progress', {
+          percent: progress.percent,
+          received: progress.received,
+          total: progress.total
+        });
+      },
+      event
+    );
+
+    // Verify download
+    const fileSize = fs.statSync(TEMP_ZIP).size;
+    if (fileSize === 0) {
+      throw new Error('Downloaded file is empty (0 bytes)');
+    }
+
+    log('Download verified: ' + TEMP_ZIP + ' (' + (fileSize / 1024 / 1024).toFixed(2) + ' MB)');
+    event.sender.send('ai-message', 'Download verified: ' + (fileSize / 1024 / 1024).toFixed(2) + ' MB');
+
+    // Step 3: Extract with AI
+    event.sender.send('status-update', {
+      status: 'installing',
+      message: 'Extracting files...',
+      installPath: 'Installing to: ' + INSTALL_DIR
+    });
+
+    await extractZip(TEMP_ZIP, INSTALL_DIR, null, event);
 
     // Step 4: Verify installation
     event.sender.send('status-update', { status: 'verifying', message: 'Verifying installation...' });
-    
+    event.sender.send('ai-message', 'Verifying installation...');
+
     if (!verifyInstallation()) {
       throw new Error('Installation verification failed');
     }
 
-    // Step 5: Create uninstaller
-    createUninstaller();
+    event.sender.send('ai-message', 'Installation verified');
 
-    // Step 6: Add to registry
+    // Step 4.5: Install prerequisites (VC++ Redistributable, TAP adapter)
+    event.sender.send('ai-message', 'Installing system prerequisites...');
+    await installPrerequisites(event);
+
+    // Step 4.6: Clean up any existing broken shortcuts
+    const desktopPath = path.join(require('os').homedir(), 'Desktop');
+    const oldShortcut = path.join(desktopPath, 'AoX.lnk');
+    if (fs.existsSync(oldShortcut)) {
+      try {
+        fs.unlinkSync(oldShortcut);
+        log('Removed old desktop shortcut: ' + oldShortcut);
+      } catch (err) {
+        log('Could not remove old shortcut: ' + err.message);
+      }
+    }
+
+    // Step 5: Create registry entry for game client
+    event.sender.send('ai-message', 'Registering game client...');
     await addToRegistry();
 
-    // Step 7: Cleanup
+    // Step 6: Create uninstaller
+    // NOTE: We DON'T create a desktop shortcut here - NSIS already created "AoX" shortcut
+    // that points to THIS bootstrapper. User clicks "AoX" -> runs this app -> checks/launches game
+    event.sender.send('ai-message', 'Finalizing installation...');
+    createUninstaller();
+
+    // Step 6: Cleanup
+    event.sender.send('ai-message', 'Cleaning up temporary files...');
     if (fs.existsSync(TEMP_ZIP)) {
       fs.unlinkSync(TEMP_ZIP);
+    }
+    if (fs.existsSync(tempDir)) {
+      fs.rmSync(tempDir, { recursive: true, force: true });
     }
 
     event.sender.send('status-update', { status: 'complete', message: 'Installation complete!' });
-    
+    event.sender.send('ai-message', 'Installation complete!');
+
+    log('=== Installation Completed Successfully ===');
     return { success: true };
 
   } catch (err) {
-    // Cleanup on error
-    if (fs.existsSync(TEMP_ZIP)) {
-      fs.unlinkSync(TEMP_ZIP);
+    log('=== Installation Failed: ' + err.message + ' ===');
+
+    // Comprehensive AI-powered cleanup on failure
+    try {
+      event.sender.send('ai-message', 'Cleaning up failed installation...');
+
+      // Remove temp directory and all contents
+      if (fs.existsSync(tempDir)) {
+        log('Cleaning up: Removing temp directory...');
+        fs.rmSync(tempDir, { recursive: true, force: true });
+      }
+
+      // Remove temp zip if it exists elsewhere
+      if (fs.existsSync(TEMP_ZIP)) {
+        log('Cleaning up: Removing temp zip...');
+        fs.unlinkSync(TEMP_ZIP);
+      }
+
+      // Remove incomplete installation
+      if (fs.existsSync(INSTALL_DIR)) {
+        // Check if installation was actually completed
+        if (!fs.existsSync(CLIENT_EXE)) {
+          log('Cleaning up: Removing incomplete installation...');
+          fs.rmSync(INSTALL_DIR, { recursive: true, force: true });
+        }
+      }
+
+      log('Cleanup complete');
+      event.sender.send('ai-message', 'Cleanup complete');
+    } catch (cleanupErr) {
+      log('Cleanup error (non-fatal): ' + cleanupErr.message);
     }
-    if (fs.existsSync(INSTALL_DIR)) {
-      fs.rmSync(INSTALL_DIR, { recursive: true, force: true });
-    }
-    
+
+    // Send error to UI
+    event.sender.send('status-update', {
+      status: 'error',
+      message: 'Installation failed - all files cleaned up'
+    });
+
     throw err;
   }
 });
 
-ipcMain.handle('launch-client', () => {
-  if (fs.existsSync(CLIENT_EXE)) {
-    spawn(CLIENT_EXE, [], {
-      detached: true,
-      stdio: 'ignore'
-    }).unref();
+ipcMain.handle('show-logs', () => {
+  const { shell } = require('electron');
 
-    // Close bootstrapper after launching
-    setTimeout(() => {
-      app.quit();
-    }, 1000);
-
+  if (fs.existsSync(LOG_FILE)) {
+    shell.openPath(LOG_FILE);
+    log('User opened log file');
     return true;
+  } else {
+    log('Log file does not exist yet');
+    const msg = '=== AoX Installer Log ===\nNo log entries yet. The installer may not have started properly.\n';
+    fs.writeFileSync(LOG_FILE, msg);
+    shell.openPath(LOG_FILE);
+    return false;
   }
+});
+
+// AI-POWERED LAUNCH with multiple fallback methods
+ipcMain.handle('launch-client', async () => {
+  if (!fs.existsSync(CLIENT_EXE)) {
+    log('Client EXE not found, cannot launch');
+    return false;
+  }
+
+  log('AI attempting to launch client...');
+
+  // Method 1: Using exec with quoted path (most reliable)
+  try {
+    log('Trying method 1: exec with quoted path...');
+    exec('"' + CLIENT_EXE + '"', (error) => {
+      if (error) {
+        log('Method 1 launch error (non-fatal): ' + error.message);
+      }
+    });
+
+    log('Client launched successfully (method 1)');
+    setTimeout(() => app.quit(), 1000);
+    return true;
+  } catch (err1) {
+    log('Method 1 failed: ' + err1.message);
+  }
+
+  // Method 2: Using shell.openPath
+  try {
+    log('Trying method 2: shell.openPath...');
+    const { shell } = require('electron');
+    await shell.openPath(CLIENT_EXE);
+    log('Client launched successfully (method 2)');
+    setTimeout(() => app.quit(), 1000);
+    return true;
+  } catch (err2) {
+    log('Method 2 failed: ' + err2.message);
+  }
+
+  // Method 3: Using PowerShell
+  try {
+    log('Trying method 3: PowerShell Start-Process...');
+    await new Promise((resolve, reject) => {
+      exec('powershell.exe -Command "Start-Process -FilePath \'' + CLIENT_EXE.replace(/'/g, "''") + '\'"', (error) => {
+        if (error) reject(error);
+        else resolve();
+      });
+    });
+    log('Client launched successfully (method 3)');
+    setTimeout(() => app.quit(), 1000);
+    return true;
+  } catch (err3) {
+    log('Method 3 failed: ' + err3.message);
+  }
+
+  // Method 4: Using cmd /c with quoted path
+  try {
+    log('Trying method 4: cmd /c with quoted path...');
+    exec('"' + CLIENT_EXE + '"', (error) => {
+      if (error) {
+        log('Method 4 error: ' + error.message);
+      }
+    });
+    log('Client launched successfully (method 4)');
+    setTimeout(() => app.quit(), 1000);
+    return true;
+  } catch (err4) {
+    log('Method 4 failed: ' + err4.message);
+  }
+
+  log('All launch methods failed');
   return false;
 });
+

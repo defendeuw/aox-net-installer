@@ -9,26 +9,41 @@
   },
   "build": {
     "appId": "com.aox.net.installer",
-    "productName": "AoX Net Installer",
-    "directories": {
-      "output": "dist"
-    },
+    "productName": "AoX",
+    "files": [
+      "main.js",
+      "preload.js",
+      "index.html",
+      "AoX.ico",
+      "icon.ico",
+      "prerequisites/**/*",
+      "!node_modules/**/*",
+      "node_modules/adm-zip/**/*",
+      "node_modules/unzipper/**/*"
+    ],
+    "asarUnpack": [
+      "node_modules/adm-zip/**/*",
+      "node_modules/unzipper/**/*",
+      "prerequisites/**/*"
+    ],
     "win": {
+      "icon": "AoX.ico",
       "target": [
-        {
-          "target": "nsis",
-          "arch": ["x64"]
-        }
+        "nsis"
       ]
     },
     "nsis": {
       "oneClick": false,
-      "allowToChangeInstallationDirectory": true,
-      "createDesktopShortcut": true,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": false,
+      "installerIcon": "AoX.ico",
+      "uninstallerIcon": "AoX.ico",
+      "installerHeaderIcon": "AoX.ico",
+      "createDesktopShortcut": "always",
       "createStartMenuShortcut": true,
-      "shortcutName": "AoX Net",
-      "artifactName": "AoX-Net-Installer-Setup.exe",
-      "deleteAppDataOnUninstall": true
+      "runAfterFinish": false,
+      "shortcutName": "AoX",
+      "include": "build/installer.nsh"
     }
   },
   "keywords": [],
@@ -39,6 +54,8 @@
     "electron-builder": "24.13.3"
   },
   "dependencies": {
+    "adm-zip": "^0.5.16",
+    "png-to-ico": "^3.0.1",
     "unzipper": "^0.10.14"
   }
 }
