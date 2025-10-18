@@ -894,7 +894,7 @@ function getLocalVersion() {
   return null;
 }
 
-// Fetch server version
+// Fetch server version (returns version string)
 function fetchServerVersion() {
   return new Promise((resolve, reject) => {
     http.get(VERSION_URL, (response) => {
@@ -905,6 +905,27 @@ function fetchServerVersion() {
           const versionData = JSON.parse(data);
           log('Server version: ' + versionData.version);
           resolve(versionData.version);
+        } catch (err) {
+          reject(new Error('Failed to parse version data'));
+        }
+      });
+    }).on('error', (err) => {
+      reject(err);
+    });
+  });
+}
+
+// Fetch full server version data (returns entire JSON object)
+function fetchServerVersionData() {
+  return new Promise((resolve, reject) => {
+    http.get(VERSION_URL, (response) => {
+      let data = '';
+      response.on('data', chunk => data += chunk);
+      response.on('end', () => {
+        try {
+          const versionData = JSON.parse(data);
+          log('Server version data: ' + JSON.stringify(versionData));
+          resolve(versionData);
         } catch (err) {
           reject(new Error('Failed to parse version data'));
         }
@@ -1006,6 +1027,17 @@ ipcMain.handle('download-client', async (event) => {
     });
 
     await extractZip(TEMP_ZIP, INSTALL_DIR, null, event);
+
+    // Step 3.5: Write version.json to prevent update loop
+    event.sender.send('ai-message', 'Updating version information...');
+    try {
+      const versionData = await fetchServerVersionData();
+      fs.writeFileSync(VERSION_FILE, JSON.stringify(versionData, null, 2), 'utf8');
+      log('Successfully wrote version.json: ' + VERSION_FILE);
+    } catch (err) {
+      log('Warning: Could not write version.json: ' + err.message);
+      // Don't fail installation if version write fails
+    }
 
     // Step 4: Verify installation
     event.sender.send('status-update', { status: 'verifying', message: 'Verifying installation...' });

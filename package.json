@@ -1,6 +1,6 @@
 {
   "name": "aox-bootstrapper",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "AoX Net Installer - Downloads and installs the Armies of Exigo Matchmaking Client",
   "main": "main.js",
   "scripts": {
